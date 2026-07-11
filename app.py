@@ -5,12 +5,9 @@ import nest_asyncio
 import time
 import random
 
-# Apply the nest_asyncio monkey patch to allow running nested event loops
-# within Streamlit's pre-existing Tornado web server environment.
+# Apply the nest_asyncio monkey patch (Created by Ewald de Wit) 
 nest_asyncio.apply()
 
-# Configure the visual layout of the Streamlit interface to wide mode.
-# Wide mode is critical for side-by-side rendering of multiple worker LLM responses.
 st.set_page_config(
     page_title="Multi-LLM Cross-Reflection Engine",
     page_icon="🤖",
@@ -18,19 +15,19 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Define the dictionary of available free-tier models on OpenRouter as of mid-2026.
-# These identifiers map directly to OpenRouter's chat completion endpoints.
+# The definitive list of current models.
 AVAILABLE_MODELS = {
     "Meta: Llama 3.3 70B Instruct (Free)": "meta-llama/llama-3.3-70b-instruct:free",
-    "Google: Gemini 2.5 Flash (Free)": "google/gemini-2.5-flash:free",
+    "Google DeepMind: Gemini 2.5 Flash (Free)": "google/gemini-2.5-flash:free",
+    "Google DeepMind: Gemini 3.5 Flash (Free)": "google/gemini-3.5-flash:free",
+    "Google DeepMind: Gemini 3.1 Pro Preview (Free)": "google/gemini-3.1-pro-preview:free",
+    "OpenAI: ChatGPT-4o Mini": "openai/gpt-4o-mini",
+    "Anthropic: Claude 3.5 Sonnet": "anthropic/claude-3.5-sonnet",
     "NVIDIA: Nemotron 3 Ultra 550B (Free)": "nvidia/nemotron-3-ultra:free",
-    "NVIDIA: Nemotron 3 Super 120B (Free)": "nvidia/nemotron-3-super:free",
     "Tencent: Hy3 MoE 295B (Free)": "tencent/hy3:free",
-    "Cohere: North Mini Code (Free)": "cohere/north-mini-code:free",
-    "Poolside: Laguna-M (Free)": "poolside/laguna-m:free"
+    "Cohere: North Mini Code (Free)": "cohere/north-mini-code:free"
 }
 
-# Ensure session state variables exist to maintain consistent performance across runs.
 if "worker_responses" not in st.session_state:
     st.session_state.worker_responses = {}
 if "final_synthesis" not in st.session_state:
@@ -39,7 +36,7 @@ if "execution_time" not in st.session_state:
     st.session_state.execution_time = 0.0
 
 # -----------------------------------------------------------------------------
-# ASYNCHRONOUS API ORCHESTRATION ENGINE
+# ASYNCHRONOUS API ORCHESTRATION ENGINE (WITH FALLBACKS)
 # -----------------------------------------------------------------------------
 
 async def fetch_llm_response(
@@ -48,43 +45,55 @@ async def fetch_llm_response(
     model_id: str, 
     api_key: str, 
     messages: list,
+    thinking_mode: bool = False,
     max_retries: int = 5,
     initial_delay: float = 2.0,
     max_delay: float = 16.0,
     backoff_factor: float = 2.0
 ) -> dict:
-    """
-    Executes a high-concurrency POST request to the OpenRouter unified API.
-    Implements dynamic error isolation and robust exponential backoff with jitter
-    to handle rate-limiting (HTTP 429) and transient backend failures (HTTP 5xx).
-    """
+    
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://streamlit.io",
-        "X-OpenRouter-Title": "Multi-LLM Cross-Reflection Engine",
-        "X-OpenRouter-Cache": "true"  # Instructs OpenRouter to leverage edge-level response caching
+        "X-OpenRouter-Title": "Multi-LLM Cross-Reflection Engine"
     }
+    
+    # THE FALLBACK UPGRADE: We pass an array of models. 
+    # If the first one chokes, it instantly routes to a generic free model.
     payload = {
-        "model": model_id,
+        "models": [model_id, "openrouter/free"], 
         "messages": messages,
-        "temperature": 0.5  # Fixed moderate temperature for stable analytical performance
+        "temperature": 0.5 
     }
+    
+    if thinking_mode:
+        payload["reasoning"] = {"effort": "high"}
 
     for attempt in range(1, max_retries + 1):
         try:
-            async with session.post(url, json=payload, headers=headers, timeout=45) as response:
+            async with session.post(url, json=payload, headers=headers, timeout=60) as response:
                 status = response.status
                 
                 if status == 200:
                     data = await response.json()
-                    # Validate payload integrity and handle unexpected parsing anomalies
                     if "choices" in data and len(data["choices"]) > 0:
                         content = data["choices"][0]["message"]["content"]
+                        
+                        reasoning_content = data["choices"][0]["message"].get("reasoning_details", "")
+                        if reasoning_content:
+                            content = f"### 🧠 Internal Thoughts:\n_{reasoning_content}_\n\n---\n\n### 🗣️ Final Answer:\n{content}"
+
+                        # Check if OpenRouter had to use the backup model
+                        actual_model_used = data.get("model", model_id)
+                        display_name = model_friendly_name
+                        if actual_model_used != model_id and "openrouter" not in actual_model_used:
+                            display_name += f" (⚠️ Backup Triggered: {actual_model_used})"
+
                         return {
-                            "friendly_name": model_friendly_name,
-                            "model_id": model_id,
+                            "friendly_name": display_name,
+                            "model_id": actual_model_used,
                             "success": True,
                             "text": content,
                             "error": None
@@ -95,10 +104,9 @@ async def fetch_llm_response(
                             "model_id": model_id,
                             "success": False,
                             "text": "",
-                            "error": "Malformed JSON payload returned from the API."
+                            "error": "API returned empty data."
                         }
                 
-                # Check for transient, retryable status codes (Rate limits or server outages)
                 elif status in [429, 500, 502, 503, 504]:
                     if attempt == max_retries:
                         return {
@@ -106,16 +114,14 @@ async def fetch_llm_response(
                             "model_id": model_id,
                             "success": False,
                             "text": "",
-                            "error": f"API Request failed with status {status} after {max_retries} attempts."
+                            "error": f"Failed after {max_retries} attempts (Status {status})."
                         }
-                
-                # Treat other statuses (400, 401, 403) as critical and non-retryable
                 else:
                     try:
                         err_payload = await response.json()
                         err_msg = err_payload.get("error", {}).get("message", "No message provided")
                     except Exception:
-                        err_msg = "Unknown client-side failure."
+                        err_msg = "Unknown error."
                     return {
                         "friendly_name": model_friendly_name,
                         "model_id": model_id,
@@ -131,7 +137,7 @@ async def fetch_llm_response(
                     "model_id": model_id,
                     "success": False,
                     "text": "",
-                    "error": f"Request timed out consistently after {max_retries} attempts."
+                    "error": "Request timed out."
                 }
         except Exception as e:
             if attempt == max_retries:
@@ -140,10 +146,9 @@ async def fetch_llm_response(
                     "model_id": model_id,
                     "success": False,
                     "text": "",
-                    "error": f"Network transmission error: {str(e)}"
+                    "error": f"Error: {str(e)}"
                 }
         
-        # Calculate next backoff interval applying the compounding factor and uniform jitter
         delay = min(max_delay, initial_delay * (backoff_factor ** (attempt - 1)))
         jitter = random.uniform(0.0, 0.1 * delay)
         await asyncio.sleep(delay + jitter)
@@ -153,208 +158,129 @@ async def fetch_llm_response(
         "model_id": model_id,
         "success": False,
         "text": "",
-        "error": "Exhausted all backoff retry protocols."
+        "error": "Failed completely."
     }
 
-async def execute_parallel_run(selected_workers: dict, api_key: str, prompt: list) -> list:
-    """
-    Spawns multiple simultaneous asynchronous fetch tasks inside a clean ClientSession,
-    reusing TCP connections across all concurrent workers to minimize latency.
-    """
+async def execute_parallel_run(selected_workers: dict, api_key: str, prompt: list, thinking_mode: bool) -> list:
     async with aiohttp.ClientSession() as session:
         tasks = [
-            fetch_llm_response(session, friendly_name, model_id, api_key, prompt)
+            fetch_llm_response(session, friendly_name, model_id, api_key, prompt, thinking_mode)
             for friendly_name, model_id in selected_workers.items()
         ]
         return await asyncio.gather(*tasks)
 
 # -----------------------------------------------------------------------------
-# INTERACTIVE USER INTERFACE CONSTRUCTS
+# INTERFACE
 # -----------------------------------------------------------------------------
 
-# Sidebar Panel for API authentication and model inventory mapping
 with st.sidebar:
     st.image("https://img.icons8.com/nolan/128/artificial-intelligence.png", width=70)
     st.title("Engine Config")
-    st.markdown("---")
-    
-    # Secure field for API verification
-    openrouter_key = st.text_input(
-        "OpenRouter API Key",
-        type="password",
-        help="Access key generated from your openrouter.ai settings page."
-    )
+    openrouter_key = st.text_input("OpenRouter API Key", type="password")
     
     st.markdown("### Model Configuration")
-    
-    # Interactive multi-select panel for establishing the Worker baseline
     worker_selections = st.multiselect(
         "Choose Phase 1 Workers",
         options=list(AVAILABLE_MODELS.keys()),
         default=[
-            "Meta: Llama 3.3 70B Instruct (Free)",
-            "Google: Gemini 2.5 Flash (Free)",
-            "Tencent: Hy3 MoE 295B (Free)"
-        ],
-        help="These models will process your input query simultaneously."
+            "Google DeepMind: Gemini 3.5 Flash (Free)",
+            "Google DeepMind: Gemini 3.1 Pro Preview (Free)",
+            "Meta: Llama 3.3 70B Instruct (Free)"
+        ]
     )
     
-    # Dropdown selector for establishing the synthesis authority
     judge_selection = st.selectbox(
         "Choose Phase 2 Judge",
         options=list(AVAILABLE_MODELS.keys()),
-        index=2,  # Defaults to NVIDIA Nemotron Ultra
-        help="This high-capacity model evaluates worker outputs and compiles the consensus."
+        index=4
     )
     
-    st.markdown("---")
-    st.markdown(
-        "<small style='color: grey;'>Orchestrated via Streamlit Community Cloud & OpenRouter Gateway.</small>",
-        unsafe_allow_html=True
-    )
+    thinking_mode = st.toggle("🧠 Enable Thinking Mode", value=False)
 
-# Primary Layout Presentation
 st.title("🤖 Multi-LLM Cross-Reflection Engine")
-st.caption("A production-ready parallel orchestration and peer-review platform for large language models.")
+st.caption("Now with automated fallback routing!")
 
-# Primary prompt capture container
-user_prompt = st.text_area(
-    "Submit your prompt for collaborative cross-reflection:",
-    placeholder="e.g., Explain the physical limits of optical photolithography and propose three alternative high-throughput nanostructuring methods.",
-    height=120
-)
+user_prompt = st.text_area("Submit your prompt:", height=120)
 
-col_ctrl_1, col_ctrl_2 = st.columns([1, 4])
-with col_ctrl_1:
-    submit_trigger = st.button("Initialize Engine", use_container_width=True, type="primary")
-
-# -----------------------------------------------------------------------------
-# TWO-PHASE PIPELINE EXECUTION ORCHESTRATION
-# -----------------------------------------------------------------------------
-
-if submit_trigger:
-    # Pre-flight credential and selection safety audits
+if st.button("Initialize Engine", type="primary"):
     if not openrouter_key:
-        st.error("Engine execution aborted: OpenRouter API key missing. Please insert your credentials in the sidebar.")
+        st.error("Missing OpenRouter API key.")
     elif not worker_selections:
-        st.error("Engine execution aborted: Please select at least one Worker model to initiate Phase 1.")
+        st.error("Select at least one Worker model.")
     elif not user_prompt.strip():
-        st.warning("Please input a valid prompt query to kickstart execution.")
+        st.warning("Input a valid prompt.")
     else:
-        # Build worker configuration mapping based on UI options
         active_workers = {name: AVAILABLE_MODELS[name] for name in worker_selections}
         judge_model_id = AVAILABLE_MODELS[judge_selection]
-        
-        # Format the system prompt for processing
         formatted_messages = [{"role": "user", "content": user_prompt}]
         
-        # -----------------------------------------------------
-        # PHASE 1: SIMULTANEOUS CONCURRENT EXECUTION
-        # -----------------------------------------------------
         st.markdown("### Phase 1: Simultaneous Execution")
         progress_tracker = st.empty()
-        progress_tracker.info("Establishing connection with OpenRouter. Dispatching requests in parallel...")
+        progress_tracker.info("Dispatching requests in parallel (with backups ready)...")
         
         start_timestamp = time.time()
-        
-        # Execute the high-concurrency tasks via nested loop framework
         loop = asyncio.get_event_loop()
         worker_outputs = loop.run_until_complete(
-            execute_parallel_run(active_workers, openrouter_key, formatted_messages)
+            execute_parallel_run(active_workers, openrouter_key, formatted_messages, thinking_mode)
         )
         
-        elapsed_workers_time = time.time() - start_timestamp
         progress_tracker.empty()
         
-        # Layout worker outputs dynamically in parallel visual columns
-        num_columns = len(worker_outputs)
-        columns = st.columns(num_columns, border=True)
-        
+        columns = st.columns(len(worker_outputs), border=True)
         for idx, col in enumerate(columns):
             response_data = worker_outputs[idx]
-            model_header = response_data["friendly_name"]
-            
             with col:
-                st.markdown(f"##### 🟢 {model_header}")
+                st.markdown(f"##### 🟢 {response_data['friendly_name']}")
                 if response_data["success"]:
                     st.write(response_data["text"])
                 else:
                     st.error(response_data["error"])
         
-        # Cache raw worker outcomes in session state for pipeline transfer
         st.session_state.worker_responses = {
             item["friendly_name"]: item["text"] for item in worker_outputs if item["success"]
         }
         
-        # -----------------------------------------------------
-        # PHASE 2: CROSS-ANALYSIS & COMPILATION BY THE JUDGE
-        # -----------------------------------------------------
-        if not st.session_state.worker_responses:
-            st.error("Phase 2 aborted: All worker tasks failed to deliver output.")
-        else:
+        if st.session_state.worker_responses:
             st.markdown("---")
             st.markdown("### Phase 2: Cross-Analysis & Synthesis")
             judge_loader = st.empty()
-            judge_loader.info(f"Transferring baseline outputs to Judge ({judge_selection}). Analyzing for bias and compiling consensus...")
+            judge_loader.info("Synthesizing final consensus...")
             
-            # Construct the synthetic assessment prompt to instruct the Judge model
-            synthesis_system_instruction = (
-                "You are an elite research consensus arbitrator. Your primary role is to evaluate answers "
-                "from multiple independent expert models. Step-by-step: \n"
-                "1. Read the user's original query and all the generated raw answers.\n"
-                "2. Conduct a rigorous logical audit. Expose logical flaws, subtle hallucinations, "
-                "factual inaccuracies, and structural biases across each response.\n"
-                "3. Cross-examine contradictions, highlighting where experts diverge and reconciliate any discrepancies.\n"
-                "4. Compile a synthesized master response that integrates the verified strengths of all responses. "
-                "Deliver a deeply detailed, structured, clear, and logically flawless master response."
-            )
-            
-            # Compile the baseline content payload for the Judge
-            synthesis_input_payload = f"Original Query: {user_prompt}\n\n"
-            for source_model, raw_response in st.session_state.worker_responses.items():
-                synthesis_input_payload += f"=== Raw Response from [{source_model}] ===\n{raw_response}\n\n"
+            synthesis_input = f"Original Query: {user_prompt}\n\n"
+            for source, raw in st.session_state.worker_responses.items():
+                synthesis_input += f"=== Raw Response [{source}] ===\n{raw}\n\n"
             
             judge_messages = [
-                {"role": "system", "content": synthesis_system_instruction},
-                {"role": "user", "content": synthesis_input_payload}
+                {"role": "system", "content": "You are an elite research consensus arbitrator. Expose flaws and compile a flawless master response."},
+                {"role": "user", "content": synthesis_input}
             ]
             
-            # Spawn a dedicated client session for the Judge evaluation
-            async def run_judge_pipeline():
+            async def run_judge():
                 async with aiohttp.ClientSession() as session:
                     return await fetch_llm_response(
-                        session, judge_selection, judge_model_id, openrouter_key, judge_messages
+                        session, judge_selection, judge_model_id, openrouter_key, judge_messages, thinking_mode
                     )
             
-            judge_response = loop.run_until_complete(run_judge_pipeline())
-            
-            total_elapsed_time = time.time() - start_timestamp
-            st.session_state.execution_time = total_elapsed_time
+            judge_response = loop.run_until_complete(run_judge())
+            st.session_state.execution_time = time.time() - start_timestamp
             judge_loader.empty()
             
-            # Display final synthesized results
             if judge_response["success"]:
                 st.session_state.final_synthesis = judge_response["text"]
                 st.success(f"Synthesis compiled successfully in {st.session_state.execution_time:.2f} seconds.")
-                st.markdown("#### Master Consensus & Synthesis Report")
                 st.markdown(st.session_state.final_synthesis)
             else:
-                st.error(f"Synthesis generation failed: {judge_response['error']}")
+                st.error(f"Synthesis failed: {judge_response['error']}")
 
-# Persistent state presentation logic (Ensures UI elements persist on runtime updates)
 elif st.session_state.final_synthesis:
     st.markdown("---")
-    st.markdown("### Phase 1: Simultaneous Execution (Cached Data)")
-    cached_workers_count = len(st.session_state.worker_responses)
-    columns = st.columns(cached_workers_count, border=True)
-    
-    for idx, (model_header, cached_text) in enumerate(st.session_state.worker_responses.items()):
+    st.markdown("### Phase 1: Simultaneous Execution (Cached)")
+    columns = st.columns(len(st.session_state.worker_responses), border=True)
+    for idx, (header, text) in enumerate(st.session_state.worker_responses.items()):
         with columns[idx]:
-            st.markdown(f"##### 🟢 {model_header}")
-            st.write(cached_text)
+            st.markdown(f"##### 🟢 {header}")
+            st.write(text)
             
     st.markdown("---")
-    st.markdown("### Phase 2: Cross-Analysis & Synthesis (Cached Data)")
-    st.caption(f"Compiled in {st.session_state.execution_time:.2f} seconds.")
-    st.markdown("#### Master Consensus & Synthesis Report")
+    st.markdown("### Phase 2: Cross-Analysis & Synthesis (Cached)")
     st.markdown(st.session_state.final_synthesis)
